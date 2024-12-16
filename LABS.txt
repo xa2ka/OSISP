@@ -1,0 +1,1222 @@
+//////LR1//////////////
+
+#include <windows.h>
+#include <iostream>
+#include <vector>
+#include <random>
+#include <chrono>
+#include <iomanip>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <algorithm>
+
+constexpr size_t ARRAY_SIZE = 1e8; // Размер массива
+constexpr size_t UPDATE_STEP = 1e6; // Интервал для обновления прогресса
+
+struct TaskData {
+    int id;
+    std::vector<int>* data;
+    std::atomic<int>* progressCounter;
+    std::mutex* mtx;
+    std::condition_variable* progressCondition;
+    bool* finished;
+};
+
+// Поток для отображения прогресса
+void monitorProgress(TaskData* task) {
+    while (!*(task->finished)) {
+        {
+            std::unique_lock<std::mutex> lock(*(task->mtx));
+            task->progressCondition->wait(lock);
+        }
+
+        std::cout << "Поток " << task->id << ": обработано " << *(task->progressCounter)
+            << " итераций." << '\r' << std::flush;
+    }
+}
+
+// Поток для сортировки
+void performSorting(TaskData* task) {
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    std::sort(task->data->begin(), task->data->end(), [&task](int a, int b) {
+        (*task->progressCounter)++;
+        if (*task->progressCounter % UPDATE_STEP == 0) {
+            task->progressCondition->notify_all();
+        }
+        return a < b;
+        });
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    auto elapsed = std::chrono::duration<double>(endTime - startTime).count();
+
+    {
+        std::lock_guard<std::mutex> lock(*(task->mtx));
+        *(task->finished) = true;
+        task->progressCondition->notify_all();
+    }
+
+    std::cout << "\nПоток " << task->id << " завершил сортировку за "
+        << std::fixed << std::setprecision(6) << elapsed << " секунд." << std::endl;
+}
+
+int main() {
+    setlocale(LC_ALL, "Russian");
+
+    std::vector<int> array(ARRAY_SIZE);
+
+    // Заполнение массива случайными числами
+    std::random_device rd;
+    std::mt19937 generator(rd());
+    std::uniform_int_distribution<int> distribution(1, 100);
+
+    for (size_t i = 0; i < ARRAY_SIZE; ++i) {
+        array[i] = distribution(generator);
+    }
+
+    constexpr int THREAD_COUNT = 5;
+    std::vector<std::thread> threads;
+    std::vector<std::thread> progressThreads;
+
+    TaskData tasks[THREAD_COUNT];
+    std::atomic<int> progressCounter(0);
+    std::mutex mtx;
+    std::condition_variable progressCondition;
+    bool finished = false;
+
+    // Создание потоков
+    for (int i = 0; i < THREAD_COUNT; ++i) {
+        tasks[i] = { i + 1, &array, &progressCounter, &mtx, &progressCondition, &finished };
+
+        // Поток сортировки
+        threads.emplace_back(performSorting, &tasks[i]);
+
+        // Поток мониторинга прогресса
+        progressThreads.emplace_back(monitorProgress, &tasks[i]);
+    }
+
+    // Ожидание завершения потоков сортировки
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Сообщаем потокам мониторинга, что работа завершена
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        finished = true;
+        progressCondition.notify_all();
+    }
+
+    // Ожидание завершения потоков мониторинга
+    for (auto& pt : progressThreads) {
+        pt.join();
+    }
+
+    std::cout << "Все потоки завершены." << std::endl;
+    return 0;
+}
+
+
+/////LR2/////////////
+
+#include <iostream>
+#include <fstream>
+#include <thread>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <chrono>
+
+std::mutex fileLock;
+
+void processChunk(const std::string& filename, int startIdx, int endIdx, std::vector<std::string>& outputData) {
+    std::ifstream fileStream(filename);
+    if (!fileStream.is_open()) {
+        std::cerr << "Не удалось открыть файл: " << filename << std::endl;
+        return;
+    }
+
+    std::string currentLine;
+    int lineIndex = 0;
+
+    while (std::getline(fileStream, currentLine)) {
+        if (lineIndex >= startIdx && lineIndex < endIdx) {
+            std::lock_guard<std::mutex> lock(fileLock);  // Защита данных
+            outputData.push_back(currentLine);  // Добавление строки
+        }
+        lineIndex++;
+    }
+
+    fileStream.close();
+}
+
+int main() {
+    setlocale(LC_ALL, "Russian");
+
+    std::string fileName;
+    int threadsCount = 0;
+
+    std::cout << "Введите путь к файлу: ";
+    std::cin >> fileName;
+
+    while (threadsCount <= 0) {
+        std::cout << "Укажите количество потоков: ";
+        std::cin >> threadsCount;
+        if (threadsCount <= 0) {
+            std::cout << "Количество потоков должно быть положительным числом.\n";
+        }
+    }
+
+    // Открытие файла для подсчета строк
+    std::ifstream inputFile(fileName);
+    if (!inputFile.is_open()) {
+        std::cerr << "Не удалось открыть файл: " << fileName << std::endl;
+        return 1;
+    }
+
+    int totalLines = 0;
+    std::string line;
+    while (std::getline(inputFile, line)) {
+        totalLines++;
+    }
+    inputFile.close();
+
+    if (totalLines == 0) {
+        std::cerr << "Файл пуст!" << std::endl;
+        return 1;
+    }
+
+    int linesPerThread = totalLines / threadsCount;
+    std::vector<std::thread> threadList;
+    std::vector<std::string> fileContent;
+
+    auto startTime = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < threadsCount; ++i) {
+        int startLine = i * linesPerThread;
+        int endLine = (i == threadsCount - 1) ? totalLines : startLine + linesPerThread;
+        threadList.emplace_back(processChunk, fileName, startLine, endLine, std::ref(fileContent));
+    }
+
+    // Ожидаем завершения всех потоков
+    for (auto& t : threadList) {
+        t.join();
+    }
+
+    auto endTime = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsedTime = endTime - startTime;
+
+    std::cout << "Процесс завершён. Время работы: " << elapsedTime.count() << " секунд.\n";
+
+    std::cout << "Содержимое файла:\n";
+    for (const auto& line : fileContent) {
+        std::cout << line << std::endl;
+    }
+
+    return 0;
+}
+///////LR3
+
+#include <windows.h>
+#include <stdio.h>
+#include <locale.h>
+#define BUFFER_SIZE 1024
+#define PIPE_NAME L"\\\\.\\pipe\\LogPipe"
+
+int main() {
+    setlocale(LC_ALL, "Russian_Russia.1251");
+    HANDLE pipe;
+    char buffer[BUFFER_SIZE];
+    DWORD bytes_written;
+    while (true) {
+        pipe = CreateFile(PIPE_NAME, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (pipe != INVALID_HANDLE_VALUE) {
+            break;
+        }
+        Sleep(1000);
+    }
+
+    while (true) {
+        printf("ВВЕДИТЕ ССОБЩЕНИЕ(ENGLISH): ");
+        fgets(buffer, BUFFER_SIZE, stdin);
+        buffer[strcspn(buffer, "\n")] = '\0'; // УДАЛИТЬ СИМВОЛ ПЕРЕНОСА СТРОКИ
+
+        if (!WriteFile(pipe, buffer, strlen(buffer) + 1, &bytes_written, NULL)) {
+            fprintf(stderr, "ОШИБКА ПРИ ЗАПИСИ В КАНАЛ. ОШИБКА: %ld\n", GetLastError());
+            break;
+        }
+    }
+
+    CloseHandle(pipe);
+    return 0;
+}
+
+
+
+#include <windows.h>
+#include <stdio.h>
+#include <time.h>
+
+#define _CRT_SECURE_NO_WARNINGS 1
+#define BUFFER_SIZE 1024
+#define PIPE_NAME L"\\\\.\\pipe\\LogPipe"
+#define MAX_CLIENTS 5
+
+HANDLE log_mutex;
+
+void log_message(const char* client_id, const char* message) {
+    WaitForSingleObject(log_mutex, INFINITE);
+
+    HANDLE file = CreateFile(L"MESSAGE_SERVER.txt",FILE_APPEND_DATA,FILE_SHARE_READ,NULL,OPEN_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+
+    if (file != INVALID_HANDLE_VALUE) {
+        char log_entry[BUFFER_SIZE + 100];
+        time_t now = time(NULL);
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &now);
+        char time_str[20];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+        snprintf(log_entry, sizeof(log_entry), "[%s] Client %s: %s\n", time_str, client_id, message);
+
+        DWORD bytes_written;
+        WriteFile(file, log_entry, strlen(log_entry), &bytes_written, NULL);
+        CloseHandle(file);
+    }
+    else {fprintf(stderr, "FAILED TO OPEN LOG FILE. ERROR: %ld\n", GetLastError());}
+    ReleaseMutex(log_mutex);
+}
+
+
+DWORD WINAPI client_handler(LPVOID param) {
+    HANDLE pipe = (HANDLE)param;
+    char buffer[BUFFER_SIZE];
+    DWORD bytes_read;
+    char client_id[10];
+    snprintf(client_id, sizeof(client_id), "%d", GetCurrentThreadId());
+
+    while (ReadFile(pipe, buffer, sizeof(buffer) - 1, &bytes_read, NULL)) {
+        buffer[bytes_read] = '\0';
+        log_message(client_id, buffer);
+    }
+
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+    return 0;
+}
+
+int main() {
+    HANDLE pipe;
+    HANDLE threads[MAX_CLIENTS];
+    int thread_count = 0;
+
+    HANDLE h_file = CreateFile(L"MESSAGE_SERVER.txt",GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,NULL);
+
+    CloseHandle(h_file);
+
+    log_mutex = CreateMutex(NULL, FALSE, NULL);
+
+    if (log_mutex == NULL) {fprintf(stderr, "FAILED TO CREATE MUTEX. ERROR: %ld\n", GetLastError());return 1;}
+
+    while (1) {
+        pipe = CreateNamedPipe(PIPE_NAME,PIPE_ACCESS_INBOUND,PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,MAX_CLIENTS,BUFFER_SIZE,BUFFER_SIZE,0,NULL);
+
+        if (pipe == INVALID_HANDLE_VALUE) {fprintf(stderr, "FAILED TO CREATE NAMED PIPE. ERROR: %ld\n", GetLastError());return 1;}
+
+        printf("WAITING FOR CLIENTS TO CONNECT...\n");
+
+        BOOL connected = ConnectNamedPipe(pipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+
+        if (connected) {
+            printf("CLIENT CONNECTED.\n");
+
+            if (thread_count < MAX_CLIENTS) 
+            {
+                threads[thread_count] = CreateThread(
+                    NULL,0,client_handler,(LPVOID)pipe,0,NULL);
+                thread_count++;
+                if (threads[thread_count] == NULL){printf("CREATETHREAD FAILED, ERROR: %ld\n", GetLastError());CloseHandle(pipe);}
+            }
+            else {
+                fprintf(stderr, "MAX CLIENTS REACHED. CONNECTION REFUSED.\n");
+                DisconnectNamedPipe(pipe);
+                CloseHandle(pipe);
+            }
+        }
+    }
+
+    WaitForMultipleObjects(thread_count, threads, TRUE, INFINITE);
+
+    for (int i = 0; i < thread_count; i++) {CloseHandle(threads[i]);}
+
+    CloseHandle(log_mutex);
+    return 0;
+}
+
+/////LR4///////
+
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <chrono>
+#include <atomic>
+#include <condition_variable>
+
+std::mutex mtx_reader_count;
+std::mutex mtx_write;
+std::condition_variable cv_readers;
+std::condition_variable cv_writer;
+std::atomic<int> active_readers(0);
+std::atomic<int> waiting_writers(0);
+std::atomic<int> shared_data(0);
+std::atomic<bool> running(true);
+
+int unsuccessful_reads = 0;
+int unsuccessful_writes = 0;
+int successful_reads = 0;
+int successful_writes = 0;
+
+double total_read_time = 0.0;
+double total_write_time = 0.0;
+double read_block_time = 0.0;
+double write_block_time = 0.0;
+
+void reader_function(int id, int read_duration) {
+    while (running) {
+        auto block_start = std::chrono::high_resolution_clock::now();
+        std::unique_lock<std::mutex> lock(mtx_reader_count);
+
+        // Проверка на наличие писателей
+        if (waiting_writers > 0 && active_readers == 0) {
+            ++unsuccessful_reads;
+            std::cout << "Reader " << id << " is waiting due to writer(s) waiting." << std::endl;
+            cv_writer.wait(lock);
+        }
+
+        active_readers++;
+        lock.unlock();
+
+        auto block_end = std::chrono::high_resolution_clock::now();
+        read_block_time += std::chrono::duration<double>(block_end - block_start).count();
+
+        auto read_start = std::chrono::high_resolution_clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(read_duration));
+
+        std::cout << "Reader " << id << " read data: " << shared_data.load() << std::endl;
+        auto read_end = std::chrono::high_resolution_clock::now();
+
+        lock.lock();
+        active_readers--;
+        if (active_readers == 0) {
+            cv_writer.notify_one(); // Разрешаем писателям писать
+        }
+        lock.unlock();
+
+        successful_reads++;
+        total_read_time += std::chrono::duration<double>(read_end - read_start).count();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+void writer_function(int id, int write_duration) {
+    while (running) {
+        auto block_start = std::chrono::high_resolution_clock::now();
+        waiting_writers++;
+
+        std::unique_lock<std::mutex> lock(mtx_write);
+        cv_writer.wait(lock, []() { return active_readers == 0; });
+
+        auto block_end = std::chrono::high_resolution_clock::now();
+        write_block_time += std::chrono::duration<double>(block_end - block_start).count();
+
+        shared_data++;
+        std::cout << "Writer " << id << " wrote data: " << shared_data.load() << std::endl;
+
+        lock.unlock();
+
+        successful_writes++;
+        total_write_time += write_duration / 1000.0;
+
+        waiting_writers--;
+        cv_writer.notify_all();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+int main() {
+    setlocale(LC_ALL, "RU"); // Устанавливаем русскую локаль
+
+    int num_readers = 3;
+    int num_writers = 4;
+    int read_duration = 200;
+    int write_duration = 1000;
+
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < num_readers; ++i) {
+        threads.emplace_back(reader_function, i + 1, read_duration);
+    }
+
+    for (int i = 0; i < num_writers; ++i) {
+        threads.emplace_back(writer_function, i + 1, write_duration);
+    }
+
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    running = false;
+
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    std::cout << "\n----- Results -----\n";
+    std::cout << "Readers (successful: " << successful_reads << ", unsuccessful: " << unsuccessful_reads << ")\n";
+    std::cout << "Writers (successful: " << successful_writes << ")\n";
+    std::cout << "Average time (read: " << (successful_reads ? total_read_time / successful_reads : 0) << " sec, write: " << (successful_writes ? total_write_time / successful_writes : 0) << " sec)\n";
+    std::cout << "Total blocking time (read: " << read_block_time << " sec, write: " << write_block_time << " sec)\n";
+
+    return 0;
+}
+////LR5
+
+
+#define WIN32_LEAN_AND_MEAN
+
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctime>
+#include <iostream>
+#include <thread>
+#include <string>
+#include <atomic>
+#include <stdlib.h>
+
+// Необходимо связать с Ws2_32.lib, Mswsock.lib и Advapi32.lib
+#pragma comment (lib, "Ws2_32.lib")
+#pragma comment (lib, "Mswsock.lib")
+#pragma comment (lib, "AdvApi32.lib")
+
+#define DEFAULT_BUFLEN 512
+#define DEFAULT_PORT "27015"
+std::atomic<bool> isRunning(true); // Флаг для завершения отправки
+
+SOCKET ConnectSocket = INVALID_SOCKET;
+
+std::string static GenRandom(const int len) {
+    srand(time(0));
+    static const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    std::string tmp_s;
+    tmp_s.reserve(len);
+
+    for (int i = 0; i < len; ++i) {
+        tmp_s += alphanum[rand() % (sizeof(alphanum) - 1)];
+    }
+
+    return tmp_s;
+}
+
+// get msg
+void static ReceiveMessages() {
+    int iResult;
+    char recvbuf[DEFAULT_BUFLEN];
+    int recvbuflen = DEFAULT_BUFLEN;
+    while (isRunning) {
+        iResult = recv(ConnectSocket, recvbuf, recvbuflen, 0);
+        if (iResult > 0) {
+            recvbuf[iResult] = '\0';
+            printf("СООБЩЕНИЕ ОТ СЕРВЕРА: %s\n", recvbuf);
+        }
+        else if (iResult == 0) {
+            printf("СОЕДИНЕНИЕ ЗАКРЫТО СЕРВЕРОМ.\n");
+            break;
+        }
+        else {
+            printf("ОШИБКА ПОЛУЧЕНИЯ: %d\n", WSAGetLastError());
+            break;
+        }
+    }
+}
+
+// Функция для отправки сообщений
+void static SendMessages() {
+    int iResult;
+    char sendbuf[DEFAULT_BUFLEN];
+    while (true) {
+        printf(" -> ВВЕДИТЕ СООБЩЕНИЕ: ");
+        fgets(sendbuf, sizeof(sendbuf), stdin);
+
+        size_t len = strlen(sendbuf);
+        if (len > 0 && sendbuf[len - 1] == '\n') {
+            sendbuf[len - 1] = '\0';
+        }
+
+        if (strlen(sendbuf) == 0) {
+            sendbuf[0] = '\0';
+            iResult = send(ConnectSocket, sendbuf, 1, 0);
+            if (iResult == SOCKET_ERROR) {
+                printf("ОШИБКА ОТПРАВКИ: %d\n", WSAGetLastError());
+                isRunning = false;
+                break;
+            }
+            isRunning = false;
+            break;
+        }
+        else {
+            iResult = send(ConnectSocket, sendbuf, (int)strlen(sendbuf), 0);
+            if (iResult == SOCKET_ERROR) {
+                printf("ОШИБКА ОТПРАВКИ: %d\n", WSAGetLastError());
+                break;
+            }
+        }
+    }
+}
+
+int main() {
+    setlocale(LC_ALL, "RUS");
+    WSADATA wsaData;
+    int iResult;
+
+    // Инициализация Winsock
+    iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (iResult != 0) {
+        printf("ОШИБКА WSAStartup: %d\n", iResult);
+        return 1;
+    }
+
+    struct addrinfo* result = NULL, * ptr = NULL, hints;
+
+    ZeroMemory(&hints, sizeof(hints)); //ipv4
+    hints.ai_family = AF_INET; // поток сокет
+    hints.ai_socktype = SOCK_STREAM; // TCP
+    hints.ai_protocol = IPPROTO_TCP; // 
+
+    // Разрешение адреса сервера и порта
+    iResult = getaddrinfo("127.0.0.1", DEFAULT_PORT, &hints, &result);
+    if (iResult != 0) {
+        printf("ОШИБКА getaddrinfo: %d\n", iResult);
+        WSACleanup(); #include <iostream>
+#include <thread>
+#include <atomic>
+#include <string>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <cstdlib>
+#include <ctime>
+#include <locale>
+
+#pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Mswsock.lib")
+#pragma comment(lib, "AdvApi32.lib")
+
+#define BUFFER_SIZE 512
+#define SERVER_PORT "27015"
+
+            std::atomic<bool> isActive(true); // флаг активности программы
+        SOCKET clientSocket = INVALID_SOCKET;
+
+        std::string generateRandomID(int length) {
+            srand(static_cast<unsigned int>(time(0)));
+            const char charset[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            std::string result;
+            result.reserve(length);
+            for (int i = 0; i < length; ++i) {
+                result += charset[rand() % (sizeof(charset) - 1)];
+            }
+            return result;
+        }
+
+        void receiveFromServer() {
+            char buffer[BUFFER_SIZE];
+            int bytesReceived;
+            while (isActive) {
+                bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE, 0);
+                if (bytesReceived > 0) {
+                    buffer[bytesReceived] = '\0';
+                    std::cout << "СООБЩЕНИЕ ОТ СЕРВЕРА: " << buffer << std::endl;
+                }
+                else if (bytesReceived == 0) {
+                    std::cout << "Соединение с сервером закрыто." << std::endl;
+                    break;
+                }
+                else {
+                    std::cerr << "Ошибка получения данных: " << WSAGetLastError() << std::endl;
+                    break;
+                }
+            }
+        }
+
+        void sendToServer() {
+            char sendBuffer[BUFFER_SIZE];
+            int bytesSent;
+            while (true) {
+                std::cout << "-> ВВЕДИТЕ СООБЩЕНИЕ: ";
+                fgets(sendBuffer, sizeof(sendBuffer), stdin);
+
+                size_t length = strlen(sendBuffer);
+                if (length > 0 && sendBuffer[length - 1] == '\n') {
+                    sendBuffer[length - 1] = '\0';
+                }
+
+                if (strlen(sendBuffer) == 0) {
+                    sendBuffer[0] = '\0';
+                    bytesSent = send(clientSocket, sendBuffer, 1, 0);
+                    if (bytesSent == SOCKET_ERROR) {
+                        std::cerr << "Ошибка отправки сообщения: " << WSAGetLastError() << std::endl;
+                        isActive = false;
+                        break;
+                    }
+                    isActive = false;
+                    break;
+                }
+                else {
+                    bytesSent = send(clientSocket, sendBuffer, static_cast<int>(strlen(sendBuffer)), 0);
+                    if (bytesSent == SOCKET_ERROR) {
+                        std::cerr << "Ошибка отправки сообщения: " << WSAGetLastError() << std::endl;
+                        break;
+                    }
+                }
+            }
+        }
+
+        int main() {
+            setlocale(LC_ALL, "RUS");
+
+            WSADATA wsaData;
+            int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (result != 0) {
+                std::cerr << "Ошибка WSAStartup: " << result << std::endl;
+                return 1;
+            }
+
+            addrinfo* addrInfo = nullptr, * ptr = nullptr, hints;
+            ZeroMemory(&hints, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+
+            result = getaddrinfo("127.0.0.1", SERVER_PORT, &hints, &addrInfo);
+            if (result != 0) {
+                std::cerr << "Ошибка getaddrinfo: " << result << std::endl;
+                WSACleanup();
+                return 1;
+            }
+
+            clientSocket = socket(addrInfo->ai_family, addrInfo->ai_socktype, addrInfo->ai_protocol);
+            if (clientSocket == INVALID_SOCKET) {
+                std::cerr << "Ошибка создания сокета: " << WSAGetLastError() << std::endl;
+                freeaddrinfo(addrInfo);
+                WSACleanup();
+                return 1;
+            }
+
+            result = connect(clientSocket, addrInfo->ai_addr, static_cast<int>(addrInfo->ai_addrlen));
+            if (result == SOCKET_ERROR) {
+                closesocket(clientSocket);
+                clientSocket = INVALID_SOCKET;
+            }
+
+            freeaddrinfo(addrInfo);
+
+            if (clientSocket == INVALID_SOCKET) {
+                std::cerr << "Не удалось подключиться к серверу." << std::endl;
+                WSACleanup();
+                return 1;
+            }
+
+            std::cout << "Подключено к серверу." << std::endl;
+
+            std::string clientID = generateRandomID(20);
+            std::cout << "Сгенерированный ID: " << clientID << std::endl;
+
+            result = send(clientSocket, clientID.c_str(), 20, 0);
+            if (result == SOCKET_ERROR) {
+                std::cerr << "Ошибка отправки ID: " << WSAGetLastError() << std::endl;
+                closesocket(clientSocket);
+                WSACleanup();
+                return 1;
+            }
+
+            std::cout << "Отправлены байты: " << result << std::endl;
+            std::cout << "Инструкции: Введите сообщение (до 50 символов) и добавьте '->имя' в конце для отправки конкретному клиенту." << std::endl;
+
+            std::thread receiveThread(receiveFromServer);
+            std::thread sendThread(sendToServer);
+
+            sendThread.join();
+            receiveThread.join();
+
+            closesocket(clientSocket);
+            WSACleanup();
+            return 0;
+        }
+
+        return 1;
+    }
+
+    // create
+    ConnectSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+
+    // Проверка на ошибки, чтобы убедиться, что сокет допустим
+    if (ConnectSocket == INVALID_SOCKET) {
+        printf("ОШИБКА ПРИ СОЗДАНИИ СОКЕТА: %ld\n", WSAGetLastError());
+        freeaddrinfo(result);
+        WSACleanup();
+        return 1;
+    }
+
+    // Подключение к серверу
+    iResult = connect(ConnectSocket, result->ai_addr, (int)result->ai_addrlen);
+    if (iResult == SOCKET_ERROR) {
+        closesocket(ConnectSocket);
+        ConnectSocket = INVALID_SOCKET;
+    }
+
+    // Освобождение ресурсов, возвращенных getaddrinfo, и вывод сообщения об ошибке
+    freeaddrinfo(result);
+
+    if (ConnectSocket == INVALID_SOCKET) {
+        printf("НЕЛЬЗЯ ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ!\n");
+        WSACleanup();
+        return 1;
+    }
+
+    printf("ПОДКЛЮЧЕНО К СЕРВЕРУ.\n");
+
+    std::string sendbufID = GenRandom(20);
+
+    printf("СГЕНЕРИРОВАННЫЙ ID: %s\n", sendbufID.c_str());
+
+    iResult = send(ConnectSocket, sendbufID.c_str(), 20, 0);
+    if (iResult == SOCKET_ERROR) {
+        printf("ОШИБКА ОТПРАВКИ: %d\n", WSAGetLastError());
+        closesocket(ConnectSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    printf("БАЙТЫ ОТПРАВЛЕНЫ: %d\n", iResult);
+    printf("ИНСТРУКЦИИ:\nВведите сообщение (50 символов) и '->имя' в конце, если хотите отправить сообщение конкретному клиенту.\n");
+
+    std::thread recvThread(ReceiveMessages);
+    std::thread sendThread(SendMessages);
+
+    sendThread.join();
+    recvThread.join();
+
+
+    closesocket(ConnectSocket);
+    WSACleanup();
+    return 0;
+}
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <string>
+#include <algorithm>
+
+#pragma comment(lib, "Ws2_32.lib")
+#define DEFAULT_PORT "27015"
+#define DEFAULT_BUFLEN 512
+
+// Структура для хранения информации о клиентах
+struct Client {
+    SOCKET socket;
+    std::string name;
+    std::vector<std::string> messages;
+
+    Client(SOCKET s, const std::string& n) : socket(s), name(n) {}
+};
+
+// Вектор для хранения всех клиентов
+std::vector<Client> clients;
+std::mutex clientsMutex; // Мьютекс для защиты доступа к клиентам
+
+// Функция для широковещательной рассылки сообщения всем клиентам, кроме отправителя
+void broadcastMessage(const std::string& message, SOCKET sender) {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    for (const auto& client : clients) {
+        if (client.socket != sender) {
+            send(client.socket, message.c_str(), int(message.size()), 0);
+        }
+    }
+}
+
+// Функция для обработки сообщений клиента
+void handleClient(SOCKET clientSocket) {
+    char recvBuf[DEFAULT_BUFLEN];
+    int bytesReceived;
+    std::string clientName;
+
+    // Получаем имя клиента
+    bytesReceived = recv(clientSocket, recvBuf, sizeof(recvBuf), 0);
+    if (bytesReceived <= 0) {
+        closesocket(clientSocket);
+        return;
+    }
+    recvBuf[bytesReceived] = '\0';  // Завершаем строку
+    clientName = recvBuf;
+    std::cout << "Клиент подключен: " << clientName << std::endl;
+
+    // Добавляем клиента в список
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex);
+        clients.push_back(Client(clientSocket, clientName));
+    }
+
+    // Основной цикл обработки сообщений клиента
+    while (true) {
+        bytesReceived = recv(clientSocket, recvBuf, sizeof(recvBuf), 0);
+        if (bytesReceived <= 0) {
+            std::cout << "Клиент " << clientName << " отключен." << std::endl;
+            break;
+        }
+
+        recvBuf[bytesReceived] = '\0';  // Завершаем строку
+        std::string message(recvBuf);
+
+        // Обработка сообщений
+        if (message.empty()) {
+            break;
+        }
+
+        size_t delimiterPos = message.find("->");
+        if (delimiterPos != std::string::npos) {
+            // Сообщение для конкретного клиента
+            std::string targetName = message.substr(delimiterPos + 2);
+            std::string privateMessage = clientName + " (private): " + message.substr(0, delimiterPos);
+
+            bool targetFound = false;
+            {
+                std::lock_guard<std::mutex> lock(clientsMutex);
+                for (auto& client : clients) {
+                    if (client.name == targetName) {
+                        targetFound = true;
+                        send(client.socket, privateMessage.c_str(), int(privateMessage.size()), 0);
+                        break;
+                    }
+                }
+            }
+
+            if (!targetFound) {
+                std::string errorMsg = "Ошибка: Клиент с именем " + targetName + " не найден.";
+                send(clientSocket, errorMsg.c_str(), int(errorMsg.size()), 0);
+            }
+        }
+        else {
+            // Широковещательное сообщение
+            std::string broadcastMsg = clientName + ": " + message;
+            broadcastMessage(broadcastMsg, clientSocket);
+        }
+    }
+
+    // Удаляем клиента из списка
+    {
+        std::lock_guard<std::mutex> lock(clientsMutex);
+        clients.erase(std::remove_if(clients.begin(), clients.end(),
+            [clientSocket](const Client& client) { return client.socket == clientSocket; }),
+            clients.end());
+    }
+
+    closesocket(clientSocket);
+}
+
+// Функция для настройки сервера
+void setupServer(SOCKET& listenSocket) {
+    struct addrinfo* result = nullptr, * ptr = nullptr, hints;
+    ZeroMemory(&hints, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;
+
+    int iResult = getaddrinfo("0.0.0.0", DEFAULT_PORT, &hints, &result);
+    if (iResult != 0) {
+        std::cerr << "Не удалось выполнить getaddrinfo: " << iResult << std::endl;
+        WSACleanup();
+        exit(1);
+    }
+
+    listenSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (listenSocket == INVALID_SOCKET) {
+        std::cerr << "Ошибка создания сокета: " << WSAGetLastError() << std::endl;
+        freeaddrinfo(result);
+        WSACleanup();
+        exit(1);
+    }
+
+    iResult = bind(listenSocket, result->ai_addr, (int)result->ai_addrlen);
+    if (iResult == SOCKET_ERROR) {
+        std::cerr << "Ошибка привязки сокета: " << WSAGetLastError() << std::endl;
+        freeaddrinfo(result);
+        closesocket(listenSocket);
+        WSACleanup();
+        exit(1);
+    }
+
+    freeaddrinfo(result);
+
+    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+        std::cerr << "Ошибка прослушивания порта: " << WSAGetLastError() << std::endl;
+        closesocket(listenSocket);
+        WSACleanup();
+        exit(1);
+    }
+
+    std::cout << "Сервер прослушивает порт " << DEFAULT_PORT << "..." << std::endl;
+}
+
+int main() {
+    setlocale(LC_ALL, "RUS");
+
+    WSADATA wsaData;
+    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (iResult != 0) {
+        std::cerr << "Ошибка WSAStartup: " << iResult << std::endl;
+        return 1;
+    }
+
+    SOCKET listenSocket = INVALID_SOCKET;
+    setupServer(listenSocket);
+
+    while (true) {
+        SOCKET clientSocket = accept(listenSocket, NULL, NULL);
+        if (clientSocket == INVALID_SOCKET) {
+            std::cerr << "Ошибка принятия соединения: " << WSAGetLastError() << std::endl;
+            continue;
+        }
+
+        std::cout << "Новый клиент подключен." << std::endl;
+        std::thread(handleClient, clientSocket).detach();
+    }
+
+    closesocket(listenSocket);
+    WSACleanup();
+    return 0;
+}
+///LR6////////
+
+#include <windows.h>
+#include <iostream>
+#include <tchar.h>
+#include <string>
+#include <vector>
+#include <iphlpapi.h>
+#include <tlhelp32.h>
+#include <VersionHelpers.h>
+#include <windows.h>
+#include <iostream>
+#include <comdef.h>
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ntdll.lib")
+extern "C" NTSTATUS NTAPI RtlGetVersion(PRTL_OSVERSIONINFOW lpVersionInformation);
+
+void GetVersionWin() {
+    std::cout << "=== Информация о версии Windows ===" << std::endl;
+
+    if (IsWindows10OrGreater()) {
+        std::cout << "Запущено под Windows 10 или выше" << std::endl;
+    }
+    else if (IsWindows8Point1OrGreater()) {
+        std::cout << "Запущено под Windows 8.1" << std::endl;
+    }
+    else if (IsWindows8OrGreater()) {
+        std::cout << "Запущено под Windows 10" << std::endl;
+    }
+    else if (IsWindows7OrGreater()) {
+        std::cout << "Запущено под Windows 7" << std::endl;
+    }
+    else {
+        std::cout << "Запущено под более старой версией Windows" << std::endl;
+    }
+    //// Получение информации о версии
+    //OSVERSIONINFOEX osvi;
+    //ZeroMemory(&osvi, sizeof(OSVERSIONINFOEX));
+    //osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
+    //// Запрос версии системы
+    //if (GetVersionEx((LPOSVERSIONINFO)&osvi)) {
+    //    std::cout << "Версия Windows: " << osvi.dwMajorVersion << "." << osvi.dwMinorVersion << std::endl;
+    //    std::cout << "Номер сборки: " << osvi.dwBuildNumber << std::endl;
+    //}
+    //else {
+    //    std::cerr << "Не удалось получить информацию о версии Windows." << std::endl;
+    //}
+}
+
+void GetVersionWin_() {
+    std::cout << "Получение версии Windows" << std::endl;
+    system("winver");
+}
+
+void DisplaySystemInfo() {
+    SYSTEM_INFO systemInfo;
+    GetSystemInfo(&systemInfo);
+
+    std::cout << "=== ИНФОРМАЦИЯ ОБ АППАРАТНОМ ОБЕСПЕЧЕНИИ ===" << std::endl;
+    std::cout << "Архитектура процессора: ";
+    switch (systemInfo.wProcessorArchitecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64:
+        std::cout << "Архитектура: x64 (AMD или Intel)" << std::endl;
+        break;
+
+    case PROCESSOR_ARCHITECTURE_ARM:
+        std::cout << "Архитектура: ARM" << std::endl;
+        break;
+
+    case PROCESSOR_ARCHITECTURE_ARM64:
+        std::cout << "Архитектура: ARM64" << std::endl;
+        break;
+
+    case PROCESSOR_ARCHITECTURE_IA64:
+        std::cout << "Архитектура: Intel Itanium" << std::endl;
+        break;
+
+    case PROCESSOR_ARCHITECTURE_INTEL:
+        std::cout << "Архитектура: x86" << std::endl;
+        break;
+
+    case PROCESSOR_ARCHITECTURE_UNKNOWN:
+        std::cout << "Архитектура: Неизвестная" << std::endl;
+        break;
+
+    default:
+        std::cout << "Архитектура: Неопределенная" << std::endl;
+        break;
+    }
+    std::cout << "Количество процессоров: " << systemInfo.dwNumberOfProcessors << std::endl;
+    std::cout << "Размер страницы: " << systemInfo.dwPageSize << " байт" << std::endl;
+}
+
+void DisplayMemoryInfo() {
+    MEMORYSTATUSEX memoryStatus;
+    memoryStatus.dwLength = sizeof(MEMORYSTATUSEX);
+    if (GlobalMemoryStatusEx(&memoryStatus)) {
+        std::cout << "\n=== ИНФОРМАЦИЯ О ПАМЯТИ ===" << std::endl;
+        std::cout << "Общая физическая память: " << memoryStatus.ullTotalPhys / (1024 * 1024) << " МБ" << std::endl;
+        std::cout << "Доступная физическая память: " << memoryStatus.ullAvailPhys / (1024 * 1024) << " МБ" << std::endl;
+        std::cout << "Общая виртуальная память: " << memoryStatus.ullTotalVirtual / (1024 * 1024) << " МБ" << std::endl;
+        std::cout << "Доступная виртуальная память: " << memoryStatus.ullAvailVirtual / (1024 * 1024) << " МБ" << std::endl;
+    }
+    else {
+        std::cerr << "Не удалось получить информацию о памяти." << std::endl;
+    }
+}
+
+void GetOSVersion(DWORD& major, DWORD& minor, DWORD& build) {
+    OSVERSIONINFOEX versionInfo;
+    ZeroMemory(&versionInfo, sizeof(OSVERSIONINFOEX));
+    versionInfo.dwOSVersionInfoSize = sizeof(OSVERSIONINFOEX);
+
+
+    if (RtlGetVersion((PRTL_OSVERSIONINFOW)&versionInfo) == 0) {
+        major = versionInfo.dwMajorVersion;
+        minor = versionInfo.dwMinorVersion;
+        build = versionInfo.dwBuildNumber;
+
+        std::cout << "Версия ОС WINDOWS: " << major << "." << minor << std::endl;
+        std::cout << "Номер сборки: " << build << std::endl;
+    }
+    else {
+        major = minor = build = 0; 
+    }
+}
+
+void DisplayOSVersion() {
+    std::cout << "\n=== ИНФОРМАЦИЯ О СИСТЕМЕ ===" << std::endl;
+
+    DWORD major, minor, build;
+    GetOSVersion(major, minor, build);
+
+    char computerName[MAX_COMPUTERNAME_LENGTH + 1];
+    DWORD size = sizeof(computerName);
+    GetComputerNameA(computerName, &size);
+    std::cout << "Имя компьютера: " << computerName << std::endl;
+
+    char userName[UNLEN + 1];
+    size = sizeof(userName);
+    GetUserNameA(userName, &size);
+    std::cout << "Имя пользователя: " << userName << std::endl;
+}
+
+void DisplayProcessorFrequency() {
+    HKEY hKey;
+    DWORD frequency, frequencySize = sizeof(frequency);
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0"), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        if (RegQueryValueEx(hKey, TEXT("~MHz"), NULL, NULL, (LPBYTE)&frequency, &frequencySize) == ERROR_SUCCESS) {
+            std::cout << "Частота процессора: " << frequency << " МГц" << std::endl;
+        }
+        RegCloseKey(hKey);
+    }
+    else {
+        std::cerr << "Не удалось получить информацию о частоте процессора." << std::endl;
+    }
+}
+
+void DisplayNetworkInfo() {
+    ULONG adapterInfoSize = 0;
+    GetAdaptersInfo(NULL, &adapterInfoSize);
+    PIP_ADAPTER_INFO adapterInfo = (IP_ADAPTER_INFO*)malloc(adapterInfoSize);
+    if (GetAdaptersInfo(adapterInfo, &adapterInfoSize) == NO_ERROR) {
+        std::cout << "\n=== ИНФОРМАЦИЯ О СЕТЕВЫХ АДАПТЕРАХ ===" << std::endl;
+        PIP_ADAPTER_INFO adapter = adapterInfo;
+        while (adapter) {
+            std::cout << "Имя адаптера: " << adapter->AdapterName << std::endl;
+            std::cout << "MAC адрес: ";
+            for (UINT i = 0; i < adapter->AddressLength; ++i) {
+                if (i != 0) std::cout << "-";
+                printf("%02X", adapter->Address[i]);
+            }
+            std::cout << std::endl;
+            std::cout << "IP адрес: " << adapter->IpAddressList.IpAddress.String << std::endl;
+            std::cout << "Описание: " << adapter->Description << std::endl;
+            adapter = adapter->Next;
+        }
+    }
+    free(adapterInfo);
+}
+
+void DisplayRunningProcesses() {
+    PROCESSENTRY32 processEntry;
+    HANDLE processSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (processSnapshot == INVALID_HANDLE_VALUE) {
+        std::cerr << "Не удалось сделать снимок процессов." << std::endl;
+        return;
+    }
+
+    processEntry.dwSize = sizeof(PROCESSENTRY32);
+    if (!Process32First(processSnapshot, &processEntry)) {
+        std::cerr << "Не удалось получить первый процесс." << std::endl;
+        CloseHandle(processSnapshot);
+        return;
+    }
+
+    std::cout << "\n=== ЗАПУЩЕННЫЕ ПРОЦЕССЫ ===" << std::endl;
+    do {
+        std::wcout << L"Процесс: " << processEntry.szExeFile << L" (PID: " << processEntry.th32ProcessID << L")" << std::endl;
+    } while (Process32Next(processSnapshot, &processEntry));
+
+    CloseHandle(processSnapshot);
+}
+
+int main() {
+    setlocale(LC_ALL, "RUS");
+    std::cout << "=== УТИЛИТА ДЛЯ СБОРА ИНФОРМАЦИИ О СИСТЕМЕ ===" << std::endl << std::endl;
+    DisplaySystemInfo();
+    DisplayMemoryInfo();
+    DisplayOSVersion();
+    DisplayProcessorFrequency();
+    DisplayNetworkInfo();
+    DisplayRunningProcesses();
+    GetVersionWin_();
+    return 0;
+}
